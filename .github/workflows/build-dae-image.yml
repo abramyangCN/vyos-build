@@ -72,8 +72,14 @@ jobs:
       - name: Stage custom kernel packages
         run: |
           mkdir -p packages
-          find scripts/package-build/linux-kernel -maxdepth 1 -type f -name '*.deb'             -exec cp -v {} packages/ \;
-          test -n "$(find packages -maxdepth 1 -type f -name 'linux-image-*.deb' -print -quit)"
+          find scripts/package-build/linux-kernel -maxdepth 1 -type f \
+            -name 'linux-image-[0-9]*_*.deb' ! -name '*-dbg_*' \
+            -exec cp -v {} packages/ \;
+          test -n "$(find packages -maxdepth 1 -type f -name 'linux-image-[0-9]*_*.deb' ! -name '*-dbg_*' -print -quit)"
+          if find packages -maxdepth 1 -type f -name '*-dbg_*.deb' | grep -q .; then
+            echo "::error::Debug kernel package must not be included"
+            exit 1
+          fi
           rm -rf scripts/package-build/linux-kernel/linux                  scripts/package-build/linux-kernel/linux-*.tar.xz                  scripts/package-build/linux-kernel/linux-*.tar.sign
           df -h
 
@@ -100,7 +106,7 @@ jobs:
       - name: Build VyOS ISO
         run: |
           version="rolling-dae-$(date -u +%Y%m%d%H%M)"
-          docker run --rm --privileged             --sysctl net.ipv6.conf.lo.disable_ipv6=0             -e GOSU_UID="$(id -u)"             -e GOSU_GID="$(id -g)"             -v "$GITHUB_WORKSPACE:/vyos"             -w /vyos             vyos/vyos-build:rolling             sudo ./build-vyos-image               --architecture amd64               --build-by "abramyangCN"               --build-type development               --version "$version"               --custom-package dae               generic
+          docker run --rm --privileged             --sysctl net.ipv6.conf.lo.disable_ipv6=0             -e GOSU_UID="$(id -u)"             -e GOSU_GID="$(id -g)"             -v "$GITHUB_WORKSPACE:/vyos"             -w /vyos             vyos/vyos-build:rolling             sudo ./build-vyos-image               --architecture amd64               --build-by "abramyangCN"               --build-type development               --version "$version"               generic
 
       - name: Prepare artifacts
         run: |
