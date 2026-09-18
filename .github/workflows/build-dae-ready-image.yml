@@ -110,7 +110,8 @@ jobs:
         run: |
           iso=build/live-image-amd64.hybrid.iso
           test -s "$iso"
-          mv "$iso" vyos-dae-ready-amd64.iso
+          sudo cp "$iso" vyos-dae-ready-amd64.iso
+          sudo chown "$(id -u):$(id -g)" vyos-dae-ready-amd64.iso
           sha256sum vyos-dae-ready-amd64.iso > vyos-dae-ready-amd64.iso.sha256
           ls -lh vyos-dae-ready-amd64.iso*
 
