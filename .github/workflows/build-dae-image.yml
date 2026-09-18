@@ -78,13 +78,6 @@ jobs:
           }
           cp -v "${kernels[0]}" "$KERNEL_CACHE_DIR/"
 
-      - name: Save dae-ready kernel
-        if: steps.kernel-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: ${{ env.KERNEL_CACHE_DIR }}
-          key: ${{ steps.kernel-cache.outputs.cache-primary-key }}
-
       - name: Validate and stage local packages
         run: |
           set -euo pipefail
@@ -135,6 +128,13 @@ jobs:
           done
           rm -rf scripts/package-build/linux-kernel/linux scripts/package-build/linux-kernel/linux-*.tar.xz scripts/package-build/linux-kernel/linux-*.tar.sign
           df -h
+
+      - name: Save dae-ready kernel
+        if: steps.kernel-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.KERNEL_CACHE_DIR }}
+          key: ${{ steps.kernel-cache.outputs.cache-primary-key }}
 
       - name: Build VyOS ISO
         run: |
