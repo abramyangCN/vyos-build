@@ -1,0 +1,122 @@
+name: Build VyOS image with dae
+
+on:
+  workflow_dispatch:
+    inputs:
+      dae_version:
+        description: "dae release tag, or latest"
+        required: true
+        default: "latest"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vyos-dae-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Check out rolling
+        uses: actions/checkout@v4
+
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          docker system prune --all --force
+          df -h
+
+      - name: Pull the official VyOS build container
+        run: docker pull vyos/vyos-build:rolling
+
+      - name: Build dae-capable kernel
+        run: |
+          docker run --rm --privileged             --sysctl net.ipv6.conf.lo.disable_ipv6=0             -e GOSU_UID="$(id -u)"             -e GOSU_GID="$(id -g)"             -v "$GITHUB_WORKSPACE:/vyos"             -w /vyos/scripts/package-build/linux-kernel             vyos/vyos-build:rolling             ./build.py --config package.toml --packages linux-kernel --keep-kernel
+
+      - name: Verify dae kernel options
+        run: |
+          config=scripts/package-build/linux-kernel/linux/.config
+          required=(
+            CONFIG_BPF=y
+            CONFIG_BPF_SYSCALL=y
+            CONFIG_BPF_JIT=y
+            CONFIG_CGROUPS=y
+            CONFIG_KPROBES=y
+            CONFIG_NET_INGRESS=y
+            CONFIG_NET_EGRESS=y
+            CONFIG_NET_SCH_INGRESS=m
+            CONFIG_NET_CLS_BPF=m
+            CONFIG_NET_CLS_ACT=y
+            CONFIG_BPF_STREAM_PARSER=y
+            CONFIG_DEBUG_INFO=y
+            CONFIG_DEBUG_INFO_BTF=y
+            CONFIG_KPROBE_EVENTS=y
+            CONFIG_BPF_EVENTS=y
+          )
+          for option in "${required[@]}"; do
+            grep -Fxq "$option" "$config" || {
+              echo "::error::Missing kernel option: $option"
+              exit 1
+            }
+          done
+          if grep -Eq '^CONFIG_DEBUG_INFO_REDUCED=y$' "$config"; then
+            echo "::error::CONFIG_DEBUG_INFO_REDUCED must be disabled"
+            exit 1
+          fi
+
+      - name: Stage custom kernel packages
+        run: |
+          mkdir -p packages
+          find scripts/package-build/linux-kernel -maxdepth 1 -type f -name '*.deb'             -exec cp -v {} packages/ \;
+          test -n "$(find packages -maxdepth 1 -type f -name 'linux-image-*.deb' -print -quit)"
+          rm -rf scripts/package-build/linux-kernel/linux                  scripts/package-build/linux-kernel/linux-*.tar.xz                  scripts/package-build/linux-kernel/linux-*.tar.sign
+          df -h
+
+      - name: Download dae package
+        env:
+          DAE_VERSION: ${{ inputs.dae_version }}
+        run: |
+          if [ "$DAE_VERSION" = latest ]; then
+            api_url=https://api.github.com/repos/daeuniverse/dae/releases/latest
+          else
+            api_url="https://api.github.com/repos/daeuniverse/dae/releases/tags/$DAE_VERSION"
+          fi
+
+          asset_url="$(
+            curl -fsSL "$api_url" |
+              jq -r '.assets[] | select(.name == "dae-linux-x86_64.deb") | .browser_download_url' |
+              head -n1
+          )"
+          test -n "$asset_url"
+          curl -fL --retry 5 "$asset_url" -o packages/dae-linux-x86_64.deb
+          dpkg-deb --info packages/dae-linux-x86_64.deb
+          dpkg-deb --field packages/dae-linux-x86_64.deb Package | grep -Fx dae
+
+      - name: Build VyOS ISO
+        run: |
+          version="rolling-dae-$(date -u +%Y%m%d%H%M)"
+          docker run --rm --privileged             --sysctl net.ipv6.conf.lo.disable_ipv6=0             -e GOSU_UID="$(id -u)"             -e GOSU_GID="$(id -g)"             -v "$GITHUB_WORKSPACE:/vyos"             -w /vyos             vyos/vyos-build:rolling             sudo ./build-vyos-image               --architecture amd64               --build-by "abramyangCN"               --build-type development               --version "$version"               --custom-package dae               generic
+
+      - name: Prepare artifacts
+        run: |
+          iso=build/live-image-amd64.hybrid.iso
+          test -s "$iso"
+          mv "$iso" vyos-dae-amd64.iso
+          sha256sum vyos-dae-amd64.iso > vyos-dae-amd64.iso.sha256
+          ls -lh vyos-dae-amd64.iso*
+
+      - name: Upload ISO
+        uses: actions/upload-artifact@v4
+        with:
+          name: vyos-dae-amd64
+          path: |
+            vyos-dae-amd64.iso
+            vyos-dae-amd64.iso.sha256
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error
