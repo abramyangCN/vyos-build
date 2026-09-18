@@ -34,6 +34,26 @@ jobs:
       - name: Pull the official VyOS build container
         run: docker pull vyos/vyos-build:rolling
 
+      - name: Download dae package
+        env:
+          DAE_VERSION: ${{ inputs.dae_version }}
+        run: |
+          if [ "$DAE_VERSION" = latest ]; then
+            api_url=https://api.github.com/repos/daeuniverse/dae/releases/latest
+          else
+            api_url="https://api.github.com/repos/daeuniverse/dae/releases/tags/$DAE_VERSION"
+          fi
+
+          asset_url="$(
+            curl -fsSL "$api_url" |
+              jq -r '.assets[] | select(.name == "dae-linux-x86_64.deb") | .browser_download_url' |
+              head -n1
+          )"
+          test -n "$asset_url"
+          curl -fL --retry 5 "$asset_url" -o packages/dae-linux-x86_64.deb
+          dpkg-deb --info packages/dae-linux-x86_64.deb
+          dpkg-deb --field packages/dae-linux-x86_64.deb Package | grep -Fx dae
+
       - name: Build dae-capable kernel
         run: |
           docker run --rm --privileged             --sysctl net.ipv6.conf.lo.disable_ipv6=0             -e GOSU_UID="$(id -u)"             -e GOSU_GID="$(id -g)"             -v "$GITHUB_WORKSPACE:/vyos"             -w /vyos/scripts/package-build/linux-kernel             vyos/vyos-build:rolling             ./build.py --config package.toml --packages linux-kernel --keep-kernel
@@ -82,26 +102,6 @@ jobs:
           fi
           rm -rf scripts/package-build/linux-kernel/linux                  scripts/package-build/linux-kernel/linux-*.tar.xz                  scripts/package-build/linux-kernel/linux-*.tar.sign
           df -h
-
-      - name: Download dae package
-        env:
-          DAE_VERSION: ${{ inputs.dae_version }}
-        run: |
-          if [ "$DAE_VERSION" = latest ]; then
-            api_url=https://api.github.com/repos/daeuniverse/dae/releases/latest
-          else
-            api_url="https://api.github.com/repos/daeuniverse/dae/releases/tags/$DAE_VERSION"
-          fi
-
-          asset_url="$(
-            curl -fsSL "$api_url" |
-              jq -r '.assets[] | select(.name == "dae-linux-x86_64.deb") | .browser_download_url' |
-              head -n1
-          )"
-          test -n "$asset_url"
-          curl -fL --retry 5 "$asset_url" -o packages/dae-linux-x86_64.deb
-          dpkg-deb --info packages/dae-linux-x86_64.deb
-          dpkg-deb --field packages/dae-linux-x86_64.deb Package | grep -Fx dae
 
       - name: Validate packages before ISO build
         run: |
