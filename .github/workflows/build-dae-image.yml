@@ -13,8 +13,11 @@ permissions:
   contents: read
 
 concurrency:
-  group: vyos-dae-${{ github.ref }}
+  group: vyos-with-dae-${{ github.ref }}
   cancel-in-progress: false
+
+env:
+  KERNEL_CACHE_DIR: kernel-cache
 
 jobs:
   build:
@@ -34,16 +37,17 @@ jobs:
       - name: Pull the official VyOS build container
         run: docker pull vyos/vyos-build:rolling
 
-      - name: Download dae package
+      - name: Download and validate dae package
         env:
           DAE_VERSION: ${{ inputs.dae_version }}
         run: |
+          set -euo pipefail
+          mkdir -p packages
           if [ "$DAE_VERSION" = latest ]; then
             api_url=https://api.github.com/repos/daeuniverse/dae/releases/latest
           else
             api_url="https://api.github.com/repos/daeuniverse/dae/releases/tags/$DAE_VERSION"
           fi
-
           asset_url="$(
             curl -fsSL "$api_url" |
               jq -r '.assets[] | select(.name == "dae-linux-x86_64.deb") | .browser_download_url' |
@@ -51,16 +55,50 @@ jobs:
           )"
           test -n "$asset_url"
           curl -fL --retry 5 "$asset_url" -o packages/dae-linux-x86_64.deb
-          dpkg-deb --info packages/dae-linux-x86_64.deb
-          dpkg-deb --field packages/dae-linux-x86_64.deb Package | grep -Fx dae
+          [ "$(dpkg-deb --field packages/dae-linux-x86_64.deb Package)" = dae ]
+          [ "$(dpkg-deb --field packages/dae-linux-x86_64.deb Architecture)" = amd64 ]
+          dpkg-deb --showformat='${Package}\t${Version}\t${Architecture}\n' --show packages/dae-linux-x86_64.deb
 
-      - name: Build dae-capable kernel
-        run: |
-          docker run --rm --privileged             --sysctl net.ipv6.conf.lo.disable_ipv6=0             -e GOSU_UID="$(id -u)"             -e GOSU_GID="$(id -g)"             -v "$GITHUB_WORKSPACE:/vyos"             -w /vyos/scripts/package-build/linux-kernel             vyos/vyos-build:rolling             ./build.py --config package.toml --packages linux-kernel --keep-kernel
+      - name: Restore dae-ready kernel
+        id: kernel-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.KERNEL_CACHE_DIR }}
+          key: ${{ runner.os }}-vyos-dae-kernel-amd64-${{ hashFiles('data/defaults.toml', 'scripts/package-build/linux-kernel/config/**', 'scripts/package-build/linux-kernel/build-kernel.sh', 'scripts/package-build/linux-kernel/build.py', 'scripts/package-build/linux-kernel/package.toml', 'scripts/package-build/linux-kernel/patches/**') }}
 
-      - name: Verify dae kernel options
+      - name: Build dae-ready kernel
+        if: steps.kernel-cache.outputs.cache-hit != 'true'
         run: |
-          config=scripts/package-build/linux-kernel/linux/.config
+          docker run --rm --privileged --sysctl net.ipv6.conf.lo.disable_ipv6=0 -e GOSU_UID="$(id -u)" -e GOSU_GID="$(id -g)" -v "$GITHUB_WORKSPACE:/vyos" -w /vyos/scripts/package-build/linux-kernel vyos/vyos-build:rolling ./build.py --config package.toml --packages linux-kernel --keep-kernel
+          mkdir -p "$KERNEL_CACHE_DIR"
+          mapfile -t kernels < <(find scripts/package-build/linux-kernel -maxdepth 1 -type f -name 'linux-image-[0-9]*_*.deb' ! -name '*-dbg_*' -print)
+          [ "${#kernels[@]}" -eq 1 ] || {
+            echo "::error::Expected exactly one runtime kernel package, found ${#kernels[@]}"
+            exit 1
+          }
+          cp -v "${kernels[0]}" "$KERNEL_CACHE_DIR/"
+
+      - name: Save dae-ready kernel
+        if: steps.kernel-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.KERNEL_CACHE_DIR }}
+          key: ${{ steps.kernel-cache.outputs.cache-primary-key }}
+
+      - name: Validate and stage local packages
+        run: |
+          set -euo pipefail
+          mapfile -t kernels < <(find "$KERNEL_CACHE_DIR" -maxdepth 1 -type f -name 'linux-image-[0-9]*_*.deb' ! -name '*-dbg_*' -print)
+          [ "${#kernels[@]}" -eq 1 ] || {
+            echo "::error::Expected exactly one cached runtime kernel package, found ${#kernels[@]}"
+            exit 1
+          }
+          [ "$(dpkg-deb --field "${kernels[0]}" Architecture)" = amd64 ]
+          rm -rf kernel-inspect
+          mkdir kernel-inspect
+          dpkg-deb -x "${kernels[0]}" kernel-inspect
+          config="$(find kernel-inspect/boot -maxdepth 1 -type f -name 'config-*' -print -quit)"
+          test -n "$config"
           required=(
             CONFIG_BPF=y
             CONFIG_BPF_SYSCALL=y
@@ -84,87 +122,40 @@ jobs:
               exit 1
             }
           done
-          if grep -Eq '^CONFIG_DEBUG_INFO_REDUCED=y$' "$config"; then
-            echo "::error::CONFIG_DEBUG_INFO_REDUCED must be disabled"
-            exit 1
-          fi
-
-      - name: Stage custom kernel packages
-        run: |
-          mkdir -p packages
-          find scripts/package-build/linux-kernel -maxdepth 1 -type f \
-            -name 'linux-image-[0-9]*_*.deb' ! -name '*-dbg_*' \
-            -exec cp -v {} packages/ \;
-          test -n "$(find packages -maxdepth 1 -type f -name 'linux-image-[0-9]*_*.deb' ! -name '*-dbg_*' -print -quit)"
-          if find packages -maxdepth 1 -type f -name '*-dbg_*.deb' | grep -q .; then
-            echo "::error::Debug kernel package must not be included"
-            exit 1
-          fi
-          rm -rf scripts/package-build/linux-kernel/linux                  scripts/package-build/linux-kernel/linux-*.tar.xz                  scripts/package-build/linux-kernel/linux-*.tar.sign
-          df -h
-
-      - name: Validate packages before ISO build
-        run: |
-          set -euo pipefail
+          ! grep -Fxq 'CONFIG_DEBUG_INFO_REDUCED=y' "$config"
+          rm -rf kernel-inspect
+          cp -v "${kernels[0]}" packages/
           mapfile -t debs < <(find packages -maxdepth 1 -type f -name '*.deb' -print | sort)
-          printf 'Local packages to embed:\n'
+          [ "${#debs[@]}" -eq 2 ] || {
+            echo "::error::Expected dae plus one kernel package, found ${#debs[@]} packages"
+            exit 1
+          }
           for deb in "${debs[@]}"; do
             dpkg-deb --showformat='${Package}\t${Version}\t${Architecture}\n' --show "$deb"
           done
-
-          dae_count=0
-          kernel_count=0
-          for deb in "${debs[@]}"; do
-            package="$(dpkg-deb --field "$deb" Package)"
-            architecture="$(dpkg-deb --field "$deb" Architecture)"
-            case "$package" in
-              dae)
-                [ "$architecture" = amd64 ]
-                dae_count=$((dae_count + 1))
-                ;;
-              linux-image-*-dbg)
-                echo "::error::Debug kernel package staged: $deb"
-                exit 1
-                ;;
-              linux-image-*)
-                [ "$architecture" = amd64 ]
-                kernel_count=$((kernel_count + 1))
-                ;;
-              *)
-                echo "::error::Unexpected local package staged: $package ($deb)"
-                exit 1
-                ;;
-            esac
-          done
-          [ "$dae_count" -eq 1 ] || {
-            echo "::error::Expected exactly one dae package, found $dae_count"
-            exit 1
-          }
-          [ "$kernel_count" -eq 1 ] || {
-            echo "::error::Expected exactly one runtime kernel package, found $kernel_count"
-            exit 1
-          }
+          rm -rf scripts/package-build/linux-kernel/linux scripts/package-build/linux-kernel/linux-*.tar.xz scripts/package-build/linux-kernel/linux-*.tar.sign
+          df -h
 
       - name: Build VyOS ISO
         run: |
-          version="rolling-dae-$(date -u +%Y%m%d%H%M)"
-          docker run --rm --privileged             --sysctl net.ipv6.conf.lo.disable_ipv6=0             -e GOSU_UID="$(id -u)"             -e GOSU_GID="$(id -g)"             -v "$GITHUB_WORKSPACE:/vyos"             -w /vyos             vyos/vyos-build:rolling             sudo ./build-vyos-image               --architecture amd64               --build-by "abramyangCN"               --build-type development               --version "$version"               generic
+          version="rolling-with-dae-$(date -u +%Y%m%d%H%M)"
+          docker run --rm --privileged --sysctl net.ipv6.conf.lo.disable_ipv6=0 -e GOSU_UID="$(id -u)" -e GOSU_GID="$(id -g)" -v "$GITHUB_WORKSPACE:/vyos" -w /vyos vyos/vyos-build:rolling sudo ./build-vyos-image --architecture amd64 --build-by "abramyangCN" --build-type development --version "$version" generic
 
       - name: Prepare artifacts
         run: |
           iso=build/live-image-amd64.hybrid.iso
           test -s "$iso"
-          mv "$iso" vyos-dae-amd64.iso
-          sha256sum vyos-dae-amd64.iso > vyos-dae-amd64.iso.sha256
-          ls -lh vyos-dae-amd64.iso*
+          mv "$iso" vyos-with-dae-amd64.iso
+          sha256sum vyos-with-dae-amd64.iso > vyos-with-dae-amd64.iso.sha256
+          ls -lh vyos-with-dae-amd64.iso*
 
       - name: Upload ISO
         uses: actions/upload-artifact@v4
         with:
-          name: vyos-dae-amd64
+          name: vyos-with-dae-amd64
           path: |
-            vyos-dae-amd64.iso
-            vyos-dae-amd64.iso.sha256
+            vyos-with-dae-amd64.iso
+            vyos-with-dae-amd64.iso.sha256
           compression-level: 0
           retention-days: 7
           if-no-files-found: error
