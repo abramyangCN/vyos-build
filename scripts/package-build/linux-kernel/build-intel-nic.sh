@@ -13,7 +13,7 @@ fi
 
 . ${KERNEL_VAR_FILE}
 
-if [ -z $KERNEL_DIR ]; then
+if [ -z "$KERNEL_DIR" ]; then
     echo "KERNEL_DIR not defined"
     exit 1
 fi
@@ -21,15 +21,17 @@ fi
 DRIVER_NAME=$1
 cd ${CWD}/ethernet-linux-${DRIVER_NAME}
 if [ -d .git ]; then
+    # clone_or_update_repo() already checked out package.toml's commit_id.
+    # Clean generated files without replacing that pinned tag with origin/main.
     git clean --force -d -x
-    git reset --hard origin/main
+    git reset --hard HEAD
 fi
 
 # See https://vyos.dev/T6155
 # See https://vyos.dev/T6162
 PATCH_DIR=${CWD}/patches/${DRIVER_NAME}
 if [ -d $PATCH_DIR ]; then
-    for patch in $(ls ${PATCH_DIR})
+    for patch in $(ls $PATCH_DIR)
     do
         echo "I: Apply patch: ${PATCH_DIR}/${patch}"
         patch -p1 < ${PATCH_DIR}/${patch}
