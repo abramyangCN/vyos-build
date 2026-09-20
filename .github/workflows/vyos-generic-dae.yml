@@ -1,0 +1,205 @@
+name: vyos-generic-dae
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vyos-generic-dae-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Official generic + DAE + full signed module set
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      UPSTREAM_COMMIT: b5ae37645cc0630543859c4b25fb2927a91c9071
+
+    steps:
+      - name: Check out independent build driver
+        uses: actions/checkout@v4
+        with:
+          path: custom
+          persist-credentials: false
+
+      - name: Check out immutable official VyOS source (not the old fork build)
+        uses: actions/checkout@v4
+        with:
+          repository: vyos/vyos-build
+          ref: ${{ env.UPSTREAM_COMMIT }}
+          path: upstream
+          persist-credentials: false
+
+      - name: Prepare disposable runner and validation tools
+        run: |
+          set -euo pipefail
+          # These are preinstalled SDKs on this disposable GitHub-hosted runner.
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            dpkg-dev kmod squashfs-tools python3-toml
+          mkdir -p reports
+          python3 -m unittest discover -s custom/scripts/ci/generic-dae -p 'test_build.py' -v
+          # Fail before the long build if runtime testing cannot use KVM.
+          test -c /dev/kvm || { echo '::error::KVM unavailable: cannot perform required boot/API tests'; exit 1; }
+          df -h .
+          free_kb=$(df --output=avail . | tail -n 1)
+          (( free_kb > 35 * 1024 * 1024 )) || { echo '::error::Need at least 35 GiB free for kernel + VPP'; exit 1; }
+
+      - name: Freeze build container digest for this entire run
+        id: container
+        run: |
+          set -euo pipefail
+          docker pull vyos/vyos-build:rolling
+          image=$(docker image inspect vyos/vyos-build:rolling --format '{{index .RepoDigests 0}}')
+          [[ "$image" == vyos/vyos-build@sha256:* ]]
+          echo "BUILD_IMAGE=$image" >> "$GITHUB_ENV"
+          echo "$image" > reports/build-container.txt
+          docker run --rm --privileged --entrypoint /bin/bash "$image" -ec '
+            command -v python3
+            command -v qemu-system-x86_64
+            command -v mksquashfs
+            python3 -c "import toml, pexpect"
+            test -r /dev/kvm
+            test -w /dev/kvm
+          '
+
+      - name: Stage and verify pinned DAE before compiling anything
+        run: |
+          set -euo pipefail
+          python3 custom/scripts/ci/generic-dae/build.py stage-dae upstream
+
+      - name: Prepare isolated overlay and freeze module source refs
+        id: prepare
+        run: |
+          set -euo pipefail
+          python3 custom/scripts/ci/generic-dae/build.py prepare upstream
+          git -C upstream diff -- data scripts/package-build > reports/upstream-overlay.patch
+          echo "$UPSTREAM_COMMIT" > reports/upstream-commit.txt
+
+      - name: Restore independent complete kernel bundle
+        id: bundle
+        uses: actions/cache/restore@v4
+        with:
+          path: generic-dae-bundle
+          key: generic-dae-amd64-v1-${{ steps.prepare.outputs.cache_id }}
+
+      - name: Build kernel and all official generic external modules together
+        if: steps.bundle.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          # One container keeps the ephemeral kernel signing key alive for every module.
+          docker run --rm --privileged \
+            --sysctl net.ipv6.conf.lo.disable_ipv6=0 \
+            -e GOSU_UID="$(id -u)" -e GOSU_GID="$(id -g)" \
+            -v "$GITHUB_WORKSPACE:/work" \
+            -w /work/upstream/scripts/package-build/linux-kernel \
+            "$BUILD_IMAGE" \
+            python3 /work/custom/scripts/ci/generic-dae/build.py build /work/upstream \
+            2>&1 | tee reports/kernel-build.log
+
+      - name: Validate complete bundle including every module signature and ABI
+        run: |
+          set -euo pipefail
+          sudo python3 custom/scripts/ci/generic-dae/build.py verify-bundle upstream \
+            2>&1 | tee reports/bundle-validation.log
+          sudo chown -R "$(id -u):$(id -g)" generic-dae-bundle reports
+
+      - name: Save verified complete bundle before ISO assembly
+        if: steps.bundle.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: generic-dae-bundle
+          key: ${{ steps.bundle.outputs.cache-primary-key }}
+
+      - name: Stage local runtime packages and recover source-build disk space
+        run: |
+          set -euo pipefail
+          python3 custom/scripts/ci/generic-dae/build.py stage upstream
+          # Only generated files below this run's official package-build checkout.
+          # The validated .deb bundle and ISO input packages live outside this directory.
+          sudo git -c safe.directory="$GITHUB_WORKSPACE/upstream" -C upstream \
+            clean -fdx -- scripts/package-build/
+          df -h .
+
+      - name: Assemble official full generic ISO with local DAE and VMware integration
+        run: |
+          set -euo pipefail
+          docker run --rm --privileged \
+            --sysctl net.ipv6.conf.lo.disable_ipv6=0 \
+            -e GOSU_UID="$(id -u)" -e GOSU_GID="$(id -g)" \
+            -v "$GITHUB_WORKSPACE:/work" -w /work/upstream \
+            "$BUILD_IMAGE" sudo ./build-vyos-image \
+              --architecture amd64 --build-type development \
+              --build-by abramyangCN \
+              --build-comment "generic-dae; official base $UPSTREAM_COMMIT" \
+              --custom-package vyos-1x-vmware generic \
+            2>&1 | tee reports/iso-build.log
+
+      - name: Verify the actual squashfs packages, DAE and HTTPS runtime
+        run: |
+          set -euo pipefail
+          test -s upstream/build/binary/live/filesystem.squashfs
+          sudo unsquashfs -quiet -no-progress -dest image-root \
+            upstream/build/binary/live/filesystem.squashfs
+          sudo python3 custom/scripts/ci/generic-dae/build.py verify upstream \
+            2>&1 | tee reports/rootfs-validation.log
+          # Release the verification copy, not the ISO or installed guest image.
+          sudo rm -rf "$GITHUB_WORKSPACE/image-root"
+
+      - name: Boot and install the ISO, then run HTTPS and DAE smoke tests
+        timeout-minutes: 60
+        run: |
+          set -euo pipefail
+          docker run --rm --privileged \
+            --sysctl net.ipv6.conf.lo.disable_ipv6=0 \
+            -v "$GITHUB_WORKSPACE:/work" -w /work/upstream \
+            "$BUILD_IMAGE" sudo scripts/check-qemu-install \
+              --iso build/live-image-amd64.hybrid.iso \
+              --debug --uefi --smoketest --match 'service_https|generic_dae' \
+              --cpu 2 --memory 4 \
+            2>&1 | tee reports/boot-api-smoketest.log
+          grep -Fq 'SUCCESS! All 2 tests passed.' reports/boot-api-smoketest.log
+          echo 'PASS: installed QEMU guest HTTPS and DAE smoketests' > reports/boot-validation.txt
+
+      - name: Publish only the tested ISO
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          sudo install -m 0644 -o "$(id -u)" -g "$(id -g)" \
+            upstream/build/live-image-amd64.hybrid.iso dist/vyos-generic-dae-amd64.iso
+          cd dist
+          sha256sum vyos-generic-dae-amd64.iso > vyos-generic-dae-amd64.iso.sha256
+          {
+            echo "workflow_commit=$GITHUB_SHA"
+            echo "upstream_commit=$UPSTREAM_COMMIT"
+            echo "build_image=$BUILD_IMAGE"
+            echo "dae=v2.1.1"
+            echo "tests=static-rootfs,all-module-signatures,UEFI-install,HTTPS,DAE"
+            echo "not_tested=physical-82599,I226-V-link,ISP-PPPoE,VyManager-end-to-end"
+          } > build-info.txt
+
+      - name: Upload tested ISO
+        uses: actions/upload-artifact@v4
+        with:
+          name: vyos-generic-dae-amd64
+          path: dist/
+          compression-level: 0
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Upload diagnostics even when the build or tests fail
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vyos-generic-dae-reports-${{ github.run_attempt }}
+          path: reports/
+          retention-days: 14
+          if-no-files-found: warn
