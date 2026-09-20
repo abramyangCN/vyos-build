@@ -211,7 +211,9 @@ jobs:
           echo "$DAE_SHA256  packages/dae-linux-x86_64.deb" | sha256sum --check --strict
           [ "$(dpkg-deb --field packages/dae-linux-x86_64.deb Package)" = dae ]
           [ "$(dpkg-deb --field packages/dae-linux-x86_64.deb Architecture)" = amd64 ]
-          dpkg-deb --contents packages/dae-linux-x86_64.deb | grep -Eq '/usr/bin/dae$'
+          package_contents="$(mktemp)"
+          dpkg-deb --contents packages/dae-linux-x86_64.deb > "$package_contents"
+          grep -Eq '/usr/bin/dae$' "$package_contents"
           dpkg-deb --showformat='${Package}\t${Version}\t${Architecture}\n' \
             --show packages/dae-linux-x86_64.deb
 
