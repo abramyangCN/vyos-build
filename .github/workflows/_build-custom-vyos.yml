@@ -55,7 +55,9 @@ jobs:
       - name: Install deterministic validation tools
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends kmod squashfs-tools
+          sudo apt-get install --yes --no-install-recommends \
+            dpkg-dev kmod squashfs-tools
+          command -v dpkg-name
           command -v modinfo
           command -v unsquashfs
 
@@ -216,6 +218,14 @@ jobs:
           grep -Eq '/usr/bin/dae$' "$package_contents"
           dpkg-deb --showformat='${Package}\t${Version}\t${Architecture}\n' \
             --show packages/dae-linux-x86_64.deb
+          dpkg-name --overwrite packages/dae-linux-x86_64.deb
+          mapfile -t dae_debs < <(find packages -maxdepth 1 -type f \
+            -name 'dae_*_amd64.deb' -print)
+          [ "${#dae_debs[@]}" -eq 1 ] || {
+            echo "::error::dpkg-name did not produce exactly one standard dae package filename"
+            exit 1
+          }
+          echo "Staged local package: ${dae_debs[0]}"
 
       - name: Build VyOS ISO
         env:
