@@ -8,7 +8,11 @@ on:
         type: boolean
       dae_version:
         required: false
-        default: latest
+        default: v2.1.1
+        type: string
+      dae_sha256:
+        required: false
+        default: ""
         type: string
       artifact_name:
         required: true
@@ -22,6 +26,10 @@ on:
 
 permissions:
   contents: read
+
+concurrency:
+  group: vyos-${{ inputs.artifact_name }}-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   KERNEL_BUNDLE_DIR: kernel-bundle
@@ -44,12 +52,19 @@ jobs:
       - name: Pull the official VyOS build container
         run: docker pull vyos/vyos-build:rolling
 
+      - name: Install deterministic validation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends kmod squashfs-tools
+          command -v modinfo
+          command -v unsquashfs
+
       - name: Restore signed kernel bundle
         id: kernel-cache
         uses: actions/cache/restore@v4
         with:
           path: ${{ env.KERNEL_BUNDLE_DIR }}
-          key: ${{ runner.os }}-vyos-dae-intel82599-amd64-v2-${{ hashFiles('data/defaults.toml', 'data/certificates/**', 'scripts/package-build/linux-kernel/config/**', 'scripts/package-build/linux-kernel/build-kernel.sh', 'scripts/package-build/linux-kernel/build-intel-nic.sh', 'scripts/package-build/linux-kernel/sign-modules.sh', 'scripts/package-build/linux-kernel/build.py', 'scripts/package-build/linux-kernel/package.toml', 'scripts/package-build/linux-kernel/patches/**') }}
+          key: ${{ runner.os }}-vyos-dae-intel82599-amd64-v3-${{ hashFiles('data/defaults.toml', 'data/certificates/**', 'scripts/package-build/linux-kernel/config/**', 'scripts/package-build/linux-kernel/common.sh', 'scripts/package-build/linux-kernel/build-kernel.sh', 'scripts/package-build/linux-kernel/build-intel-nic.sh', 'scripts/package-build/linux-kernel/sign-modules.sh', 'scripts/package-build/linux-kernel/build.py', 'scripts/package-build/linux-kernel/package.toml', 'scripts/package-build/linux-kernel/patches/**') }}
 
       - name: Build kernel and Intel 82599 drivers with one signing key
         if: steps.kernel-cache.outputs.cache-hit != 'true'
@@ -161,17 +176,39 @@ jobs:
         if: inputs.include_dae
         env:
           DAE_VERSION: ${{ inputs.dae_version }}
+          DAE_SHA256: ${{ inputs.dae_sha256 }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          if [ "$DAE_VERSION" = latest ]; then
-            api_url=https://api.github.com/repos/daeuniverse/dae/releases/latest
-          else
-            api_url="https://api.github.com/repos/daeuniverse/dae/releases/tags/$DAE_VERSION"
-          fi
-          asset_url="$(curl -fsSL "$api_url" | jq -r \
-            '.assets[] | select(.name == "dae-linux-x86_64.deb") | .browser_download_url' | head -n1)"
+          [[ "$DAE_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || {
+            echo "::error::dae_version must be an explicit release tag, not latest"
+            exit 1
+          }
+          [[ "$DAE_SHA256" =~ ^[0-9a-f]{64}$ ]] || {
+            echo "::error::dae_sha256 must be a pinned lowercase SHA-256 digest"
+            exit 1
+          }
+
+          api_url="https://api.github.com/repos/daeuniverse/dae/releases/tags/$DAE_VERSION"
+          release_json="$(mktemp)"
+          curl -fsSL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "$api_url" -o "$release_json"
+          [ "$(jq -r '.tag_name' "$release_json")" = "$DAE_VERSION" ]
+          asset_url="$(jq -er \
+            '[.assets[] | select(.name == "dae-linux-x86_64.deb")][0].browser_download_url' \
+            "$release_json")"
+          github_digest="$(jq -er \
+            '[.assets[] | select(.name == "dae-linux-x86_64.deb")][0].digest' \
+            "$release_json")"
           test -n "$asset_url"
+          [ "$github_digest" = "sha256:$DAE_SHA256" ] || {
+            echo "::error::Pinned dae digest disagrees with GitHub release metadata"
+            exit 1
+          }
           curl -fL --retry 5 "$asset_url" -o packages/dae-linux-x86_64.deb
+          echo "$DAE_SHA256  packages/dae-linux-x86_64.deb" | sha256sum --check --strict
           [ "$(dpkg-deb --field packages/dae-linux-x86_64.deb Package)" = dae ]
           [ "$(dpkg-deb --field packages/dae-linux-x86_64.deb Architecture)" = amd64 ]
           dpkg-deb --contents packages/dae-linux-x86_64.deb | grep -Eq '/usr/bin/dae$'
@@ -202,50 +239,45 @@ jobs:
         run: |
           set -euo pipefail
           test -s build/binary/live/filesystem.squashfs
-          rm -rf image-root
-          docker run --rm --privileged \
-            -e INCLUDE_DAE="$INCLUDE_DAE" \
-            -v "$GITHUB_WORKSPACE:/vyos" -w /vyos \
-            vyos/vyos-build:rolling bash -euo pipefail -c '
-              unsquashfs -quiet -no-progress -force -dest image-root \
-                build/binary/live/filesystem.squashfs
-              mapfile -t module_dirs < <(find image-root/lib/modules \
-                -mindepth 1 -maxdepth 1 -type d -print)
-              [ "${#module_dirs[@]}" -eq 1 ]
-              module_dir="${module_dirs[0]}"
-              reference_module="$(find "$module_dir/kernel" -type f \
-                -name "dummy.ko*" -print -quit)"
-              reference_key="$(modinfo -F sig_key "$reference_module")"
-              test -n "$reference_key"
-              kernel_version="$(basename "$module_dir")"
-              for name in ixgbe ixgbevf; do
-                module="$(find "$module_dir/updates" -type f \
-                  -name "$name.ko*" -print -quit)"
-                test -n "$module"
-                test -n "$(modinfo -F signer "$module")"
-                [ "$(modinfo -F sig_key "$module")" = "$reference_key" ]
-                resolved="$(modinfo -b /vyos/image-root -k "$kernel_version" \
-                  -n "$name")"
-                case "$resolved" in
-                  */updates/*) ;;
-                  *) echo "$name resolves to the wrong module: $resolved" >&2; exit 1 ;;
-                esac
-              done
+          sudo rm -rf image-root
+          sudo unsquashfs -quiet -no-progress -force -dest image-root \
+            build/binary/live/filesystem.squashfs
+          mapfile -t module_dirs < <(find image-root/lib/modules \
+            -mindepth 1 -maxdepth 1 -type d -print)
+          [ "${#module_dirs[@]}" -eq 1 ]
+          module_dir="${module_dirs[0]}"
+          reference_module="$(find "$module_dir/kernel" -type f \
+            -name 'dummy.ko*' -print -quit)"
+          reference_key="$(modinfo -F sig_key "$reference_module")"
+          test -n "$reference_key"
+          kernel_version="$(basename "$module_dir")"
+          for name in ixgbe ixgbevf; do
+            module="$(find "$module_dir/updates" -type f \
+              -name "$name.ko*" -print -quit)"
+            test -n "$module"
+            test -n "$(modinfo -F signer "$module")"
+            [ "$(modinfo -F sig_key "$module")" = "$reference_key" ]
+            resolved="$(modinfo -b "$GITHUB_WORKSPACE/image-root" \
+              -k "$kernel_version" -n "$name")"
+            case "$resolved" in
+              */updates/*) ;;
+              *) echo "$name resolves to the wrong module: $resolved" >&2; exit 1 ;;
+            esac
+          done
 
-              admindir=/vyos/image-root/var/lib/dpkg
-              dpkg-query --admindir="$admindir" -W "linux-image-*" \
-                vyos-intel-ixgbe vyos-intel-ixgbevf
-              if [ "$INCLUDE_DAE" = true ]; then
-                dpkg-query --admindir="$admindir" -W dae
-                test -x image-root/usr/bin/dae
-                image-root/usr/bin/dae --version
-              else
-                if dpkg-query --admindir="$admindir" -W dae 2>/dev/null; then
-                  echo "Unexpected dae package in dae-ready image" >&2
-                  exit 1
-                fi
-              fi
-            '
+          admindir="$GITHUB_WORKSPACE/image-root/var/lib/dpkg"
+          dpkg-query --admindir="$admindir" -W 'linux-image-*' \
+            vyos-intel-ixgbe vyos-intel-ixgbevf
+          if [ "$INCLUDE_DAE" = true ]; then
+            dpkg-query --admindir="$admindir" -W dae
+            test -x image-root/usr/bin/dae
+            sudo chroot image-root /usr/bin/dae --version
+          else
+            if dpkg-query --admindir="$admindir" -W dae 2>/dev/null; then
+              echo "Unexpected dae package in dae-ready image" >&2
+              exit 1
+            fi
+          fi
 
       - name: Prepare artifacts and build report
         env:
