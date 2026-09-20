@@ -4,9 +4,14 @@ on:
   workflow_dispatch:
     inputs:
       dae_version:
-        description: dae release tag, or latest
+        description: Pinned dae release tag
         required: true
-        default: latest
+        default: v2.1.1
+        type: string
+      dae_sha256:
+        description: SHA-256 for dae-linux-x86_64.deb
+        required: true
+        default: bae957fcfaa647e72718d4565feb282115408f8d56cc90b5d49ca21147b512d2
         type: string
 
 jobs:
@@ -15,6 +20,7 @@ jobs:
     with:
       include_dae: true
       dae_version: ${{ inputs.dae_version }}
+      dae_sha256: ${{ inputs.dae_sha256 }}
       artifact_name: vyos-with-dae-amd64
       iso_name: vyos-with-dae-amd64.iso
       version_label: with-dae
