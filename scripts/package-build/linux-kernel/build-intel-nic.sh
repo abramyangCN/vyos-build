@@ -22,7 +22,7 @@ DRIVER_NAME=$1
 cd ${CWD}/ethernet-linux-${DRIVER_NAME}
 if [ -d .git ]; then
     # clone_or_update_repo() already checked out package.toml's commit_id.
-    # Clean generated files without replacing that pinned tag with origin/main.
+    # Clean generated files without replacing that pinned revision with origin/main.
     git clean --force -d -x
     git reset --hard HEAD
 fi
