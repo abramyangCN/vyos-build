@@ -177,6 +177,7 @@ jobs:
         env:
           DAE_VERSION: ${{ inputs.dae_version }}
           DAE_SHA256: ${{ inputs.dae_sha256 }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           [[ "$DAE_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || {
@@ -190,7 +191,10 @@ jobs:
 
           api_url="https://api.github.com/repos/daeuniverse/dae/releases/tags/$DAE_VERSION"
           release_json="$(mktemp)"
-          curl -fsSL "$api_url" -o "$release_json"
+          curl -fsSL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "$api_url" -o "$release_json"
           [ "$(jq -r '.tag_name' "$release_json")" = "$DAE_VERSION" ]
           asset_url="$(jq -er \
             '[.assets[] | select(.name == "dae-linux-x86_64.deb")][0].browser_download_url' \
