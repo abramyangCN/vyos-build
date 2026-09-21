@@ -40,6 +40,12 @@ version is checked against both `vpp-dev` and `libvppinfra` before ISO assembly.
 This lets an old verified kernel bundle be repaired by rebuilding only VPP, not
 the kernel and NIC modules.
 
+VyOS applies VPP patches with `git am`; its generated package suffix can change
+between builds even when the frozen source and patch refs are identical. If that
+metadata-only drift occurs, the workflow rewrites the closure package's Debian
+Version and exact dependency fields to the cached VPP set, leaves its payload
+untouched, and then regenerates and verifies the package hash and metadata.
+
 ## DAE configuration after installation
 
 The executable, geo assets and service are in the ISO. Store your own configuration

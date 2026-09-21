@@ -74,6 +74,30 @@ class BuildTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "exactly"):
                 driver.check_vpp_closure(root)
 
+    def test_repack_deb_version_updates_version_and_exact_dependencies(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            package = root / "package"
+            (package / "DEBIAN").mkdir(parents=True)
+            (package / "usr/share/test").mkdir(parents=True)
+            (package / "usr/share/test/payload").write_text("payload-is-unchanged\n")
+            (package / "DEBIAN/control").write_text(
+                "Package: libvppinfra-dev\nVersion: 1.0.new\nArchitecture: all\n"
+                "Maintainer: CI <ci@example.invalid>\n"
+                "Depends: libvppinfra (= 1.0.new)\nDescription: test\n")
+            source = root / "source.deb"
+            destination = root / "normalized.deb"
+            subprocess.run(["dpkg-deb", "--build", "--root-owner-group", package, source],
+                           check=True, stdout=subprocess.DEVNULL)
+            driver.repack_deb_version(source, destination, "1.0.new", "1.0.old")
+            self.assertEqual(driver.package_info(destination)["version"], "1.0.old")
+            depends = driver.output("dpkg-deb", "--field", destination, "Depends")
+            self.assertEqual(depends, "libvppinfra (= 1.0.old)")
+            with tempfile.TemporaryDirectory() as extracted:
+                subprocess.run(["dpkg-deb", "-x", destination, extracted], check=True)
+                self.assertEqual((Path(extracted) / "usr/share/test/payload").read_text(),
+                                 "payload-is-unchanged\n")
+
     def test_missing_component_cannot_pass_bundle_check(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

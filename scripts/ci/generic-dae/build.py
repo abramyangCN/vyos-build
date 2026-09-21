@@ -244,6 +244,27 @@ def build_vpp_closure(root):
     shutil.copy2(root.parent / "reports/source-lock.json", closure / "source-lock.json")
 
 
+def repack_deb_version(source, destination, old_version, new_version):
+    """Normalize metadata-only VPP version drift from non-deterministic git-am.
+
+    The exact source and patch refs are checked separately before this is used.
+    Only Debian control metadata is changed; the package payload is untouched.
+    """
+    require(old_version != new_version, "Version normalization requires two different versions")
+    with tempfile.TemporaryDirectory(prefix="vpp-deb-normalize-") as temp:
+        unpacked = Path(temp) / "package"
+        run("dpkg-deb", "--raw-extract", source, unpacked)
+        control = unpacked / "DEBIAN/control"
+        original = control.read_text()
+        require(f"Version: {old_version}\n" in original,
+                "VPP closure control file has an unexpected Version field")
+        require(old_version in original, "Old VPP version is absent from control metadata")
+        normalized = original.replace(old_version, new_version)
+        require(old_version not in normalized, "Old VPP version remains in control metadata")
+        control.write_text(normalized)
+        run("dpkg-deb", "--build", "--root-owner-group", unpacked, destination)
+
+
 def merge_vpp_closure(root):
     bundle = root.parent / "generic-dae-bundle"
     closure = root.parent / "generic-dae-vpp-closure"
@@ -257,15 +278,36 @@ def merge_vpp_closure(root):
     expected = by_name["vpp-dev"]["version"]
     require(by_name["libvppinfra"]["version"] == expected,
             "Cached VPP runtime packages have inconsistent versions")
-    require(all(record["version"] == expected for record in additions),
-            "VPP closure version does not match cached VPP packages")
     vpp_dev = bundle / by_name["vpp-dev"]["file"]
     depends = output("dpkg-deb", "--field", vpp_dev, "Depends")
     require(f"libvppinfra-dev (= {expected})" in depends,
             "vpp-dev no longer has the expected exact libvppinfra-dev dependency")
+    normalized_records = []
     for record in additions:
-        shutil.copy2(closure / record["file"], bundle / record["file"])
-    records.extend(additions)
+        source = closure / record["file"]
+        info = {k: record[k] for k in ("package", "version", "architecture")}
+        destination = bundle / f"{record['package']}_{expected}_{record['architecture']}.deb"
+        if record["version"] == expected:
+            shutil.copy2(source, destination)
+        else:
+            repack_deb_version(source, destination, record["version"], expected)
+            report = root.parent / "reports/vpp-version-normalization.txt"
+            report.write_text(
+                f"package={record['package']}\n"
+                f"built_version={record['version']}\n"
+                f"normalized_version={expected}\n"
+                "reason=identical frozen source/patch refs produced a different git-am commit suffix\n")
+        normalized = package_info(destination)
+        require(normalized == {"package": info["package"], "version": expected,
+                               "architecture": info["architecture"]},
+                "Normalized VPP package metadata is invalid")
+        normalized_depends = output("dpkg-deb", "--field", destination, "Depends")
+        if record["version"] != expected:
+            require(record["version"] not in normalized_depends,
+                    "Pre-normalization VPP version remains in package dependencies")
+        normalized_records.append({**normalized, "file": destination.name,
+                                   "sha256": digest(destination)})
+    records.extend(normalized_records)
     records.sort(key=lambda record: record["package"])
     (bundle / "manifest.json").write_text(json.dumps(records, indent=2) + "\n")
     check_bundle(bundle)
