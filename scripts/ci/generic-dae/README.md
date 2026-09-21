@@ -34,6 +34,12 @@ are cached or uploaded. The key includes official commit, dedicated scripts,
 resolved dependency refs and build-container digest. The first build also builds
 VPP and can take several hours; the entire job has a 6-hour limit.
 
+VPP's `vpp-dev` has an exact-version dependency on `libvppinfra-dev`. That
+development package is kept in a small, separately keyed closure cache and its
+version is checked against both `vpp-dev` and `libvppinfra` before ISO assembly.
+This lets an old verified kernel bundle be repaired by rebuilding only VPP, not
+the kernel and NIC modules.
+
 ## DAE configuration after installation
 
 The executable, geo assets and service are in the ISO. Store your own configuration

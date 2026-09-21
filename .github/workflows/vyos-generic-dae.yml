@@ -108,6 +108,41 @@ jobs:
             python3 /work/custom/scripts/ci/generic-dae/build.py build /work/upstream \
             2>&1 | tee reports/kernel-build.log
 
+      - name: Restore exact VPP development dependency closure
+        id: vpp-closure
+        uses: actions/cache/restore@v4
+        with:
+          path: generic-dae-vpp-closure
+          key: generic-dae-vpp-closure-v1-${{ steps.prepare.outputs.vpp_cache_id }}
+
+      - name: Build only the missing VPP dependency closure
+        if: steps.vpp-closure.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          # On a full build this collects the already-produced package. On a
+          # kernel-cache hit it rebuilds only VPP, never the kernel or drivers.
+          docker run --rm --privileged \
+            --sysctl net.ipv6.conf.lo.disable_ipv6=0 \
+            -e GOSU_UID="$(id -u)" -e GOSU_GID="$(id -g)" \
+            -v "$GITHUB_WORKSPACE:/work" \
+            -w /work/upstream/scripts/package-build/vpp \
+            "$BUILD_IMAGE" \
+            python3 /work/custom/scripts/ci/generic-dae/build.py build-vpp-closure /work/upstream \
+            2>&1 | tee reports/vpp-closure-build.log
+
+      - name: Save exact VPP development dependency closure
+        if: steps.vpp-closure.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: generic-dae-vpp-closure
+          key: ${{ steps.vpp-closure.outputs.cache-primary-key }}
+
+      - name: Merge and validate the exact VPP package closure
+        run: |
+          set -euo pipefail
+          python3 custom/scripts/ci/generic-dae/build.py merge-vpp-closure upstream \
+            2>&1 | tee reports/vpp-closure-validation.log
+
       - name: Validate complete bundle including every module signature and ABI
         run: |
           set -euo pipefail

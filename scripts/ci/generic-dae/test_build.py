@@ -60,9 +60,19 @@ class BuildTests(unittest.TestCase):
             (root / "manifest.json").write_text(json.dumps([
                 {"file": "test.deb", "package": "test", "sha256": "0" * 64}
             ]))
-            with patch.object(driver, "RUNTIME_PACKAGES", {"test"}):
+            with patch.object(driver, "RUNTIME_PACKAGES", {"test"}), \
+                    patch.object(driver, "VPP_BASE_PACKAGES", set()):
                 with self.assertRaisesRegex(RuntimeError, "Corrupt"):
-                    driver.check_bundle(root)
+                    driver.check_bundle(root, require_vpp_closure=False)
+
+    def test_vpp_closure_rejects_wrong_package_set(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "manifest.json").write_text(json.dumps([
+                {"file": "wrong.deb", "package": "wrong", "sha256": "0" * 64}
+            ]))
+            with self.assertRaisesRegex(RuntimeError, "exactly"):
+                driver.check_vpp_closure(root)
 
     def test_missing_component_cannot_pass_bundle_check(self):
         with tempfile.TemporaryDirectory() as temp:

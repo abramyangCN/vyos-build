@@ -29,6 +29,8 @@ RUNTIME_PACKAGES = {
     "vyos-intel-ixgbevf", "vyos-intel-i40e", "vyos-intel-ice",
     "vyos-intel-iavf", "jool", "vyos-drivers-realtek-r8152", "vyos-ipt-netflow",
 }
+VPP_CLOSURE_PACKAGES = {"libvppinfra-dev"}
+VPP_BASE_PACKAGES = {"vpp-dev", "libvppinfra"}
 BASE_PACKAGES = {
     "vyos-1x", "vyos-user-utils", "vyos-http-api-tools", "nginx-light",
     "ssl-cert", "openssl", "frr", "nftables", "podman", "wireguard-tools",
@@ -115,8 +117,13 @@ def prepare(root):
     h.update((reports / "source-lock.json").read_bytes())
     h.update(os.environ["BUILD_IMAGE"].encode())
     cache_id = h.hexdigest()
+    vpp_h = hashlib.sha256(b"generic-dae-vpp-closure-v1")
+    for name in ("vyos-vpp-patches", "vpp"):
+        vpp_h.update(json.dumps(sources[name], sort_keys=True).encode())
+    vpp_h.update(os.environ["BUILD_IMAGE"].encode())
     with open(os.environ["GITHUB_OUTPUT"], "a") as stream:
         stream.write(f"cache_id={cache_id}\n")
+        stream.write(f"vpp_cache_id={vpp_h.hexdigest()}\n")
 
 
 def build(root):
@@ -168,12 +175,14 @@ def build(root):
     shutil.copy2(root.parent / "reports/source-lock.json", bundle / "source-lock.json")
 
 
-def check_bundle(bundle):
+def check_bundle(bundle, require_vpp_closure=True):
     records = json.loads((bundle / "manifest.json").read_text())
     require(bool(records), "Empty bundle")
     require({p.name for p in bundle.glob("*.deb")} == {r["file"] for r in records}, "Bundle file set differs from manifest")
     require(len({r["package"] for r in records}) == len(records), "Duplicate bundle package")
-    require(RUNTIME_PACKAGES <= {r["package"] for r in records}, "Missing runtime packages")
+    required = (RUNTIME_PACKAGES | VPP_BASE_PACKAGES |
+                (VPP_CLOSURE_PACKAGES if require_vpp_closure else set()))
+    require(required <= {r["package"] for r in records}, "Missing runtime packages")
     for record in records:
         filename = record["file"]
         require(Path(filename).name == filename, "Invalid bundle filename")
@@ -182,6 +191,84 @@ def check_bundle(bundle):
         require(package_info(path) == {k: record[k] for k in ("package", "version", "architecture")},
                 f"Package metadata mismatch: {filename}")
     return records
+
+
+def check_vpp_closure(closure):
+    records = json.loads((closure / "manifest.json").read_text())
+    require({r["package"] for r in records} == VPP_CLOSURE_PACKAGES,
+            "VPP closure must contain exactly the missing packages")
+    require({p.name for p in closure.glob("*.deb")} == {r["file"] for r in records},
+            "VPP closure file set differs from manifest")
+    for record in records:
+        path = closure / record["file"]
+        require(digest(path) == record["sha256"], f"Corrupt VPP closure: {record['file']}")
+        require(package_info(path) == {k: record[k] for k in ("package", "version", "architecture")},
+                f"VPP closure metadata mismatch: {record['file']}")
+    return records
+
+
+def build_vpp_closure(root):
+    """Recover the VPP development package omitted from the old kernel cache.
+
+    A fresh kernel build already leaves the package in vpp/. A cache-hit run
+    rebuilds only VPP from the same frozen refs, never the kernel/modules.
+    """
+    vpp = root / "scripts/package-build/vpp"
+    closure = root.parent / "generic-dae-vpp-closure"
+    closure.mkdir(exist_ok=True)
+    require(not list(closure.glob("*.deb")), "Refusing to mix an existing VPP closure")
+
+    def wanted_debs():
+        found = {}
+        for deb in vpp.glob("*.deb"):
+            info = package_info(deb)
+            if info["package"] in VPP_CLOSURE_PACKAGES:
+                require(info["package"] not in found, f"Duplicate VPP package: {info['package']}")
+                found[info["package"]] = (deb, info)
+        return found
+
+    found = wanted_debs()
+    if set(found) != VPP_CLOSURE_PACKAGES:
+        run("python3", "build.py", cwd=vpp)
+        found = wanted_debs()
+    require(set(found) == VPP_CLOSURE_PACKAGES,
+            f"Incomplete VPP closure: {VPP_CLOSURE_PACKAGES - set(found)}")
+    records = []
+    for name in sorted(found):
+        deb, info = found[name]
+        require(info["architecture"] in ("amd64", "all"), f"Wrong architecture: {deb}")
+        dest = closure / f"{name}_{info['version']}_{info['architecture']}.deb"
+        shutil.copy2(deb, dest)
+        records.append({**info, "file": dest.name, "sha256": digest(dest)})
+    (closure / "manifest.json").write_text(json.dumps(records, indent=2) + "\n")
+    shutil.copy2(root.parent / "reports/source-lock.json", closure / "source-lock.json")
+
+
+def merge_vpp_closure(root):
+    bundle = root.parent / "generic-dae-bundle"
+    closure = root.parent / "generic-dae-vpp-closure"
+    records = check_bundle(bundle, require_vpp_closure=False)
+    additions = check_vpp_closure(closure)
+    require((closure / "source-lock.json").read_bytes() ==
+            (root.parent / "reports/source-lock.json").read_bytes(),
+            "VPP closure source lock does not match this run")
+    by_name = {record["package"]: record for record in records}
+    require(not (set(by_name) & VPP_CLOSURE_PACKAGES), "VPP closure package already exists in bundle")
+    expected = by_name["vpp-dev"]["version"]
+    require(by_name["libvppinfra"]["version"] == expected,
+            "Cached VPP runtime packages have inconsistent versions")
+    require(all(record["version"] == expected for record in additions),
+            "VPP closure version does not match cached VPP packages")
+    vpp_dev = bundle / by_name["vpp-dev"]["file"]
+    depends = output("dpkg-deb", "--field", vpp_dev, "Depends")
+    require(f"libvppinfra-dev (= {expected})" in depends,
+            "vpp-dev no longer has the expected exact libvppinfra-dev dependency")
+    for record in additions:
+        shutil.copy2(closure / record["file"], bundle / record["file"])
+    records.extend(additions)
+    records.sort(key=lambda record: record["package"])
+    (bundle / "manifest.json").write_text(json.dumps(records, indent=2) + "\n")
+    check_bundle(bundle)
 
 
 def stage_dae(root):
@@ -332,11 +419,14 @@ def stage(root):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("stage", choices=("prepare", "build", "stage-dae", "stage", "verify", "verify-bundle"))
+    parser.add_argument("stage", choices=("prepare", "build", "build-vpp-closure",
+                                          "merge-vpp-closure", "stage-dae", "stage",
+                                          "verify", "verify-bundle"))
     parser.add_argument("root", type=Path)
     args = parser.parse_args()
     root = args.root.resolve()
-    {"prepare": prepare, "build": build, "stage-dae": stage_dae,
+    {"prepare": prepare, "build": build, "build-vpp-closure": build_vpp_closure,
+     "merge-vpp-closure": merge_vpp_closure, "stage-dae": stage_dae,
      "stage": stage, "verify": verify, "verify-bundle": verify_bundle}[args.stage](root)
 
 
