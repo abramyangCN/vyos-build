@@ -3,6 +3,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -108,7 +109,13 @@ class BuildTests(unittest.TestCase):
             override = (includes / "etc/systemd/system/dae.service.d/10-vyos-persistent.conf").read_text()
             self.assertIn("ConditionPathExists=/config/dae/config.dae", override)
             self.assertIn("validate -c /config/dae/config.dae", override)
-            self.assertTrue((includes / "etc/systemd/system/multi-user.target.wants/dae.service").is_symlink())
+            self.assertFalse((includes / "etc/systemd/system/multi-user.target.wants/dae.service").exists())
+            hook = root / "data/live-build-config/hooks/live/99-enable-dae.chroot"
+            self.assertTrue(hook.stat().st_mode & 0o111)
+            self.assertIn("systemctl enable dae.service", hook.read_text())
+            # Reproduce build-vyos-image's exact copy mode. It must not follow
+            # a dangling service symlink before local packages are installed.
+            shutil.copytree(root / "data/live-build-config", root.parent / "copied-live-build-config")
             self.assertFalse((includes / "config/dae/config.dae").exists())
 
 

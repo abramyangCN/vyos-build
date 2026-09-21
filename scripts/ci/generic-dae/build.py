@@ -319,9 +319,15 @@ def stage(root):
                         "ExecStartPre=/usr/bin/dae validate -c /config/dae/config.dae\n"
                         "ExecStart=\n"
                         "ExecStart=/usr/bin/dae run --disable-timestamp -c /config/dae/config.dae\n")
-    wants = includes / "etc/systemd/system/multi-user.target.wants"
-    wants.mkdir(parents=True, exist_ok=True)
-    (wants / "dae.service").symlink_to("/usr/lib/systemd/system/dae.service")
+    # build-vyos-image copies this tree with shutil.copytree(symlinks=False).
+    # A pre-created .wants symlink would therefore be dereferenced before the
+    # dae package exists in the chroot. Enable the unit only after packages
+    # have been installed by live-build.
+    hooks = root / "data/live-build-config/hooks/live"
+    hooks.mkdir(parents=True, exist_ok=True)
+    hook = hooks / "99-enable-dae.chroot"
+    hook.write_text("#!/bin/sh\nset -e\nsystemctl enable dae.service\n")
+    hook.chmod(0o755)
 
 
 def main():

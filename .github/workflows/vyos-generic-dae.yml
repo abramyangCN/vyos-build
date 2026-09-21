@@ -89,7 +89,10 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: generic-dae-bundle
-          key: generic-dae-amd64-v1-${{ steps.prepare.outputs.cache_id }}
+          # The first run already built and fully validated this exact bundle.
+          # This stage-only fix deliberately reuses it instead of spending
+          # another ~80 minutes rebuilding unchanged kernel/VPP/modules.
+          key: generic-dae-amd64-v1-cb6b8ccc1e2adfc3ba8a3439ea60e2aa8045418849695b880795dc3b42e27543
 
       - name: Build kernel and all official generic external modules together
         if: steps.bundle.outputs.cache-hit != 'true'
